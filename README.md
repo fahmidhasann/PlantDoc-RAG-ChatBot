@@ -8,7 +8,7 @@ PlantDoc demonstrates how to build a specialized RAG system that combines semant
 
 ## Features
 
-- **Specialized Models**: Agricultural embedding model (`recobo/agri-sentence-transformer`) + Ollama Gemma3n:e4b LLM
+- **Specialized Models**: Agricultural embedding model (`recobo/agri-sentence-transformer`) + Ollama Llama3.1:8b LLM
 - **Document Processing**: Extracts and processes 948 pages into 2,870 searchable chunks
 - **Vector Search**: ChromaDB-powered semantic search for relevant content retrieval
 - **Conversation Memory**: Maintains context across follow-up questions
@@ -32,7 +32,7 @@ PlantDoc demonstrates how to build a specialized RAG system that combines semant
 
 2. **Pull the LLM model**
    ```bash
-   ollama pull gemma3n:e4b
+   ollama pull llama3.1:8b
    ```
 
 3. **Initialize the database** (first time only)
@@ -73,7 +73,7 @@ Key settings in `config/config.yaml`:
 ```yaml
 models:
   llm:
-    name: "gemma3n:e4b"
+    name: "llama3.1:8b"
     base_url: "http://localhost:11434"
   embeddings:
     name: "recobo/agri-sentence-transformer"
@@ -110,7 +110,7 @@ The system adapts to any document domain - simply ask questions relevant to your
 5. **Source Attribution**: Return response with page references
 
 ### Models
-- **LLM**: Gemma3n:e4b (7.5GB) via Ollama for response generation
+- **LLM**: Llama3.1:8b (4.7GB) via Ollama for response generation
 - **Embeddings**: recobo/agri-sentence-transformer (768-dim) specialized for agricultural content
 - **Vector DB**: ChromaDB for efficient similarity search
 
@@ -126,7 +126,7 @@ The system adapts to any document domain - simply ask questions relevant to your
 
 **"Model not found"**
 - Ensure Ollama is running: `ollama serve`
-- Pull the model: `ollama pull gemma3n:e4b`
+- Pull the model: `ollama pull llama3.1:8b`
 
 **"Vector database is empty"**
 - Run setup: `python setup.py`
