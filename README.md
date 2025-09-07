@@ -27,29 +27,30 @@ PlantDoc demonstrates how to build a specialized RAG system that combines semant
 
 1. **Clone this repository**
    ```bash
-  git clone https://github.com/fahmidhasann/PlantDoc-RAG-ChatBot
+   git clone https://github.com/fahmidhasann/PlantDoc-RAG-ChatBot
    ```
-2. **Install dependencies**
+   
+1. **Install dependencies**
    ```bash
    pip install -r requirements.txt
    ```
 
-3. **Pull the LLM model**
+2. **Pull the LLM model**
    ```bash
    ollama pull llama3.1:8b
    ```
 
-4. **Initialize the database** (first time only)
+3. **Initialize the database** (first time only)
    ```bash
    python setup.py
    ```
 
-5. **Launch the application**
+4. **Launch the application**
    ```bash
    streamlit run app.py
    ```
 
-6. **Access the interface** at `http://localhost:8501`
+5. **Access the interface** at `http://localhost:8501`
 
 ## Architecture
 
