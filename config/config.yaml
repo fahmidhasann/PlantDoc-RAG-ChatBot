@@ -1,6 +1,6 @@
 models:
   llm:
-    name: "llama3.1:8b"
+    name: "gemma3:4b"
     base_url: "http://localhost:11434"
   embeddings:
     name: "recobo/agri-sentence-transformer"
