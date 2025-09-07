@@ -145,7 +145,7 @@ The system adapts to any document domain - simply ask questions relevant to your
 
 ### System Requirements
 - **RAM**: 8GB minimum, 16GB recommended
-- **Storage**: 5GB for models and database
+- **Storage**: 10GB for models and database
 - **Network**: Internet access for initial model downloads
 
 ## Development
