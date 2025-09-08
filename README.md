@@ -2,6 +2,12 @@
 
 An AI-powered document Q&A chatbot using Retrieval-Augmented Generation (RAG) with specialized agricultural models. While originally designed for plant pathology, it can process any PDF document for domain-specific question answering.
 
+## 🚀 Live Demo
+
+**Try it now!** ➡️ [**Plant Pathology Expert - Live Demo**](https://huggingface.co/spaces/fahmidhasan/plant-pathology-expert) 🌿
+
+Experience the app in action without any setup required. Ask questions about plant diseases, pathology, and agricultural topics to see the RAG system in real-time!
+
 ## Overview
 
 PlantDoc demonstrates how to build a specialized RAG system that combines semantic search with large language models. It processes PDF documents into searchable chunks and provides accurate, context-aware responses with source citations. The system uses agricultural-specialized embedding models but can adapt to any document domain.
