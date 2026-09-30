@@ -1,7 +1,7 @@
 /**
  * Google Gemini API Client
- * Supports Gemini 3.8 Flash (or configured model) for Multimodal Vision & Text Q&A
- * along with Google AI Studio Text Embeddings (text-embedding-004)
+ * Supports Gemini 3.8 Flash (with automatic fallback to Gemini 3.5 Flash)
+ * and Google AI Studio Text Embeddings (gemini-embedding-001 with 768 dims)
  */
 
 export interface MultimodalPayload {
@@ -17,16 +17,17 @@ export async function generateGeminiEmbedding(text: string): Promise<number[]> {
     throw new Error("GEMINI_API_KEY is not configured.");
   }
 
-  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key=${apiKey}`;
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent?key=${apiKey}`;
 
   const response = await fetch(endpoint, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      model: "models/text-embedding-004",
+      model: "models/gemini-embedding-001",
       content: {
         parts: [{ text: text.slice(0, 8000) }]
-      }
+      },
+      outputDimensionality: 768
     })
   });
 
@@ -46,7 +47,6 @@ export async function generateGeminiDiagnosis(payload: {
   imageMimeType?: string;
 }): Promise<string> {
   const apiKey = process.env.GEMINI_API_KEY;
-  const model = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 
   const systemPrompt = `You are PlantDoc, an elite plant pathologist AI expert trained on Agrios' Plant Pathology textbook (5th Edition).
 Your mission is to provide accurate, clinical, and actionable diagnosis for plant diseases based on the provided textbook context.
@@ -97,7 +97,6 @@ Guidelines:
     parts: parts
   });
 
-  // If API key is not yet set, provide a helpful mock response grounded in the knowledge base
   if (!apiKey) {
     return `### 🌿 PlantDoc Clinical Diagnosis (Demo Mode)
 
@@ -106,48 +105,43 @@ Guidelines:
 ${payload.contextChunks ? `**Retrieved Pathology Knowledge:**\n${payload.contextChunks.slice(0, 600)}...\n` : ''}
 
 **Setup Instructions:**
-To unlock full live Gemini 3.8 Flash Multimodal analysis and streaming, get your free key at [Google AI Studio](https://aistudio.google.com/) and paste it into \`.env.local\`.`;
+To unlock full live Gemini Multimodal analysis and streaming, get your free key at [Google AI Studio](https://aistudio.google.com/) and paste it into \`.env.local\`.`;
   }
 
-  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+  // Model cascade: try configured model -> gemini-3.8-flash -> gemini-3.5-flash
+  const modelsToTry = [
+    process.env.GEMINI_MODEL,
+    "gemini-3.8-flash",
+    "gemini-3.5-flash"
+  ].filter(Boolean) as string[];
 
-  const response = await fetch(endpoint, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      contents,
-      systemInstruction: {
-        parts: [{ text: systemPrompt }]
-      },
-      generationConfig: {
-        temperature: 0.3,
-        maxOutputTokens: 2048
-      }
-    })
-  });
-
-  if (!response.ok) {
-    const errText = await response.text();
-    // Fallback gracefully if model name is different in certain regions
-    if (response.status === 404 && model !== "gemini-1.5-flash") {
-      const fallbackEndpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`;
-      const fbRes = await fetch(fallbackEndpoint, {
+  for (const model of modelsToTry) {
+    try {
+      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+      const response = await fetch(endpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           contents,
-          systemInstruction: { parts: [{ text: systemPrompt }] },
-          generationConfig: { temperature: 0.3, maxOutputTokens: 2048 }
+          systemInstruction: {
+            parts: [{ text: systemPrompt }]
+          },
+          generationConfig: {
+            temperature: 0.3,
+            maxOutputTokens: 2048
+          }
         })
       });
-      if (fbRes.ok) {
-        const fbData = await fbRes.json();
-        return fbData.candidates?.[0]?.content?.parts?.[0]?.text || "No response generated.";
+
+      if (response.ok) {
+        const data = await response.json();
+        return data.candidates?.[0]?.content?.parts?.[0]?.text || "No response generated from PlantDoc.";
       }
+      console.warn(`Model ${model} returned status ${response.status}, attempting fallback...`);
+    } catch (err) {
+      console.warn(`Model ${model} call failed:`, err);
     }
-    throw new Error(`Gemini API Error (${response.status}): ${errText}`);
   }
 
-  const data = await response.json();
-  return data.candidates?.[0]?.content?.parts?.[0]?.text || "No response generated from PlantDoc.";
+  throw new Error("Gemini API call failed across all candidate models.");
 }
