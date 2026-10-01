@@ -1,9 +1,14 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { retrieveRelevantContext } from '@/lib/pinecone';
-import { generateGeminiDiagnosis } from '@/lib/gemini';
+import { buildSearchQuery, generateGeminiDiagnosis } from '@/lib/gemini';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
+
+function formatPages(page?: number, pageEnd?: number): string {
+  if (!page) return 'Page N/A';
+  return pageEnd && pageEnd !== page ? `Pages ${page}–${pageEnd}` : `Page ${page}`;
+}
 
 export async function POST(req: NextRequest) {
   try {
@@ -17,15 +22,23 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const searchQuery = query || 'Plant disease symptoms, identification and management';
+    // The textbook is English: photos and non-English questions are first turned into an
+    // English search line. Plain English questions are searched as typed (no extra Gemini call).
+    const needsRewrite = Boolean(image) || /(?=\p{L})\P{Script=Latin}/u.test(query || '');
+    const rewritten = needsRewrite
+      ? await buildSearchQuery({ userQuery: query, imageBase64: image, imageMimeType: image ? mimeType || 'image/jpeg' : undefined })
+      : '';
+    const searchQuery =
+      (image ? [query, rewritten].filter(Boolean).join(' — ') : rewritten || query) ||
+      'Plant disease symptoms, identification and management';
 
     // 1. Retrieve grounded textbook passages via Pinecone / Knowledge Base
-    const retrievedDocs = await retrieveRelevantContext(searchQuery, 4);
+    const retrievedDocs = await retrieveRelevantContext(searchQuery, 6);
 
     const contextChunks = retrievedDocs
       .map(
         (doc, index) =>
-          `[Excerpt ${index + 1} - Page ${doc.page || 'N/A'} | ${doc.chapter || ''} | ${doc.topic || ''}]\n${doc.content}`
+          `[Excerpt ${index + 1} - ${formatPages(doc.page, doc.pageEnd)} | ${doc.chapter || ''} | ${doc.topic || ''}]\n${doc.content}`
       )
       .join('\n\n---\n\n');
 
@@ -39,6 +52,7 @@ export async function POST(req: NextRequest) {
 
     const sources = retrievedDocs
       .filter(doc => doc.page)
+      .filter((doc, i, all) => all.findIndex(d => d.page === doc.page) === i)
       .map(doc => ({
         page: doc.page,
         chapter: doc.chapter || 'Plant Pathology Textbook',

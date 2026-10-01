@@ -13,7 +13,7 @@ export const FALLBACK_PATHOLOGY_KNOWLEDGE: PathologyChunk[] = [
   {
     id: "chunk_late_blight",
     page: 421,
-    chapter: "Chapter 11: Plant Diseases Caused by Oomycetes",
+    chapter: "Chapter 11: Plant Diseases Caused by Fungi",
     topic: "Late Blight of Potato and Tomato",
     pathogen: "Phytophthora infestans (Mont.) de Bary",
     symptoms: [
@@ -33,8 +33,8 @@ export const FALLBACK_PATHOLOGY_KNOWLEDGE: PathologyChunk[] = [
   },
   {
     id: "chunk_bacterial_canker",
-    page: 638,
-    chapter: "Chapter 12: Plant Diseases Caused by Prokaryotes",
+    page: 651,
+    chapter: "Chapter 12: Plant Diseases Caused by Prokaryotes: Bacteria and Mollicutes",
     topic: "Bacterial Canker of Tomato",
     pathogen: "Clavibacter michiganensis subsp. michiganensis",
     symptoms: [
@@ -53,8 +53,8 @@ export const FALLBACK_PATHOLOGY_KNOWLEDGE: PathologyChunk[] = [
   },
   {
     id: "chunk_rice_blast",
-    page: 495,
-    chapter: "Chapter 11: Plant Diseases Caused by Ascomycetes",
+    page: 463,
+    chapter: "Chapter 11: Plant Diseases Caused by Fungi",
     topic: "Rice Blast Disease",
     pathogen: "Magnaporthe oryzae (anamorph Pyricularia oryzae)",
     symptoms: [
@@ -73,8 +73,8 @@ export const FALLBACK_PATHOLOGY_KNOWLEDGE: PathologyChunk[] = [
   },
   {
     id: "chunk_powdery_mildew",
-    page: 462,
-    chapter: "Chapter 11: Plant Diseases Caused by Ascomycetes",
+    page: 448,
+    chapter: "Chapter 11: Plant Diseases Caused by Fungi",
     topic: "Powdery Mildew of Cereals, Grapes, and Cucurbits",
     pathogen: "Blumeria graminis / Erysiphe cichoracearum / Podosphaera spp.",
     symptoms: [
@@ -94,8 +94,8 @@ export const FALLBACK_PATHOLOGY_KNOWLEDGE: PathologyChunk[] = [
   },
   {
     id: "chunk_fusarium_wilt",
-    page: 542,
-    chapter: "Chapter 11: Plant Diseases Caused by Ascomycetes and Deuteromycetes",
+    page: 526,
+    chapter: "Chapter 11: Plant Diseases Caused by Fungi",
     topic: "Fusarium Wilt of Banana (Panama Disease) and Solanaceae",
     pathogen: "Fusarium oxysporum (f. sp. cubense, f. sp. lycopersici)",
     symptoms: [
@@ -114,8 +114,8 @@ export const FALLBACK_PATHOLOGY_KNOWLEDGE: PathologyChunk[] = [
   },
   {
     id: "chunk_citrus_greening",
-    page: 651,
-    chapter: "Chapter 12: Plant Diseases Caused by Prokaryotes",
+    page: 685,
+    chapter: "Chapter 12: Plant Diseases Caused by Prokaryotes: Bacteria and Mollicutes",
     topic: "Huanglongbing (HLB) / Citrus Greening",
     pathogen: "Candidatus Liberibacter asiaticus (vectored by Asian Citrus Psyllid, Diaphorina citri)",
     symptoms: [

@@ -7,7 +7,9 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "ingest": "node scripts/ingest.mjs"
+    "ingest": "node --env-file-if-exists=.env.local scripts/ingest.mjs",
+    "extract": "node scripts/extract-pdf.mjs",
+    "index-book": "node scripts/index-book.mjs"
   },
   "dependencies": {
     "@google/genai": "^2.24.0",
