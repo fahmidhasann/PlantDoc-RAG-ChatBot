@@ -25,6 +25,9 @@ import {
   UTILITY_TIMEOUT_MS,
 } from './config';
 
+/** Long enough for a per-minute window to free up, short enough to wait out. */
+const RATE_LIMIT_RETRY_MS = 3_000;
+
 let client: GoogleGenAI | null = null;
 
 function getClient(): GoogleGenAI {
@@ -48,19 +51,55 @@ function deadline(ms: number, parent?: AbortSignal): AbortSignal {
   return parent ? AbortSignal.any([parent, timeout]) : timeout;
 }
 
+/**
+ * Failure kinds, most informative first.
+ *
+ * When every model in the chain fails it is rarely for the same reason — one
+ * is rate limited, the next returns an empty answer, the last times out — and
+ * the reason worth reporting is not the one that happened last. Ranking them
+ * is what stops a rate limit being reported as "could not be reached".
+ */
+type FailureKind = 'key' | 'rate' | 'timeout' | 'empty' | 'unknown';
+
+const FAILURE_RANK: Record<FailureKind, number> = {
+  key: 0,
+  rate: 1,
+  timeout: 2,
+  empty: 3,
+  unknown: 4,
+};
+
+export function classifyGeminiError(err: unknown): FailureKind {
+  const e = err as { message?: unknown; status?: unknown; name?: unknown };
+  const message = String(e?.message ?? err ?? '');
+  const status = Number(e?.status);
+
+  if (/leaked|API key not valid|API_KEY_INVALID|PERMISSION_DENIED/i.test(message)) return 'key';
+  if (status === 403) return 'key';
+  if (status === 429 || /\b429\b|RESOURCE_EXHAUSTED|exceeded your current quota|rate limit/i.test(message)) {
+    return 'rate';
+  }
+  if (/abort|timeout|timed out/i.test(message) || e?.name === 'AbortError' || e?.name === 'TimeoutError') {
+    return 'timeout';
+  }
+  if (/returned no text|empty answer/i.test(message)) return 'empty';
+  return 'unknown';
+}
+
 /** Classifies an upstream failure so the caller can tell the user something true. */
 export function describeGeminiError(err: unknown): string {
-  const message = String((err as Error)?.message || err);
-  if (/leaked|API key not valid|API_KEY_INVALID/i.test(message)) {
-    return 'The Gemini API key was rejected. Generate a fresh one at aistudio.google.com and update GEMINI_API_KEY.';
+  switch (classifyGeminiError(err)) {
+    case 'key':
+      return 'The Gemini API key was rejected. Generate a fresh one at aistudio.google.com and set GEMINI_API_KEY.';
+    case 'rate':
+      return 'Gemini is rate limited right now — the free tier allows about 15 requests a minute per model, and every model in the chain is currently over. Wait a few seconds and ask again.';
+    case 'timeout':
+      return 'Gemini took too long to respond and the request was cancelled. Try again.';
+    case 'empty':
+      return 'Gemini returned an empty answer on every model. Try rephrasing the question.';
+    default:
+      return 'Gemini could not be reached. Check the server logs for the upstream error.';
   }
-  if (/429|RESOURCE_EXHAUSTED|quota/i.test(message)) {
-    return 'Every Gemini model on this key has hit its free-tier limit for now. Daily quotas reset at midnight Pacific.';
-  }
-  if (/abort|timeout/i.test(message)) {
-    return 'Gemini took too long to respond and the request was cancelled.';
-  }
-  return 'Gemini could not be reached.';
 }
 
 // ---------------------------------------------------------------------------
@@ -84,8 +123,39 @@ export async function streamAnswer(options: {
   contents: Content[];
   signal?: AbortSignal;
 }): Promise<AnswerStream> {
+  // The free tier's per-minute allowance is small enough that a burst of
+  // questions can exhaust every model at once. That clears in seconds, so one
+  // patient retry turns a visible failure into a short pause.
+  try {
+    return await attemptAnswer(options);
+  } catch (err) {
+    if (classifyGeminiError(err) !== 'rate' || options.signal?.aborted) throw err;
+    console.warn('[gemini] whole chain rate limited; retrying once after a pause');
+    await new Promise(resolve => setTimeout(resolve, RATE_LIMIT_RETRY_MS));
+    if (options.signal?.aborted) throw err;
+    return attemptAnswer(options);
+  }
+}
+
+/** One pass down the model chain. */
+async function attemptAnswer(options: {
+  system: string;
+  contents: Content[];
+  signal?: AbortSignal;
+}): Promise<AnswerStream> {
   const ai = getClient();
-  let lastError: unknown = new Error('No Gemini model produced an answer.');
+
+  // Keep the most informative failure seen across the whole chain, not the
+  // most recent one.
+  let bestError: unknown = new Error('No Gemini model produced an answer.');
+  let bestRank = FAILURE_RANK.unknown;
+  const noteFailure = (err: unknown) => {
+    const rank = FAILURE_RANK[classifyGeminiError(err)];
+    if (rank < bestRank) {
+      bestRank = rank;
+      bestError = err;
+    }
+  };
 
   for (const model of ANSWER_MODELS) {
     try {
@@ -120,7 +190,7 @@ export async function streamAnswer(options: {
       }
 
       if (exhausted || first === null) {
-        lastError = new Error(`${model} returned no text.`);
+        noteFailure(new Error(`${model} returned no text.`));
         console.warn(`[gemini] ${model} produced an empty answer; trying the next model.`);
         continue;
       }
@@ -138,17 +208,20 @@ export async function streamAnswer(options: {
 
       return { model, chunks: chunks() };
     } catch (err) {
-      lastError = err;
-      console.warn(`[gemini] ${model} failed:`, (err as Error)?.message || err);
-      // An invalid key or an aborted request will fail identically on every
-      // model, so stop rather than burn four round trips proving it.
-      const message = String((err as Error)?.message || err);
-      if (/API_KEY_INVALID|API key not valid|leaked/i.test(message)) break;
+      noteFailure(err);
+      const kind = classifyGeminiError(err);
+      console.warn(
+        `[gemini] ${model} failed (${kind}):`,
+        String((err as Error)?.message || err).slice(0, 300)
+      );
+      // A rejected key fails identically on every model, so stop rather than
+      // burn four round trips proving it. Same for a cancelled request.
+      if (kind === 'key') break;
       if (options.signal?.aborted) break;
     }
   }
 
-  throw lastError;
+  throw bestError;
 }
 
 // ---------------------------------------------------------------------------
