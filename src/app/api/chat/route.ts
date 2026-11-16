@@ -110,8 +110,15 @@ export async function POST(req: NextRequest) {
           image: image ?? undefined,
           signal: req.signal,
         });
+        // A photo with no question produces a search line describing what is
+        // visible, which pulls back symptom passages and little else. Someone
+        // who photographs a diseased plant wants to know what to do about it,
+        // so the implied question is added to the search.
+        const impliedIntent =
+          image && !message ? ' — control and management of this disease' : '';
+
         const searchQuery =
-          [image ? message : '', rewritten].filter(Boolean).join(' — ') ||
+          [image ? message : '', rewritten].filter(Boolean).join(' — ') + impliedIntent ||
           message ||
           'plant disease symptoms, identification and management';
 
