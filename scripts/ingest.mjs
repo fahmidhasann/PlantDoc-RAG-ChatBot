@@ -124,8 +124,13 @@ async function embedSparseBatch(pc, chunks) {
       model: SPARSE_MODEL,
       inputs: chunks.map(embeddingText),
       // 2048 is the model's ceiling; chunks are far shorter, but a long one
-      // should be covered whole rather than silently clipped at 512.
-      parameters: { inputType: 'passage', truncate: 'END', max_tokens_per_sequence: '2048' },
+      // should be covered whole rather than silently clipped at the 512
+      // default. The SDK types parameters as strings; the API wants a number.
+      parameters: {
+        inputType: 'passage',
+        truncate: 'END',
+        max_tokens_per_sequence: 2048,
+      },
     })
   );
   const rows = res.data.map(d => ({ indices: d.sparseIndices, values: d.sparseValues }));

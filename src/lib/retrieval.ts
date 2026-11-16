@@ -154,14 +154,14 @@ async function searchSparse(pc: Pinecone, query: string): Promise<Candidate[]> {
     .index(SPARSE_INDEX)
     .namespace(NAMESPACE)
     .query({
-      // A sparse index is queried with a zero-length dense vector plus the
-      // sparse one; the SDK requires `vector` to be present on the union.
-      vector: [],
+      // A sparse index is queried with `sparseVector` alone. The SDK's option
+      // union insists on a dense `vector`, but passing one — even empty — is
+      // rejected by its own validator, so the field is omitted.
       sparseVector,
       topK: CANDIDATES_PER_RETRIEVER,
       includeMetadata: true,
       filter: KIND_FILTER,
-    });
+    } as unknown as Parameters<ReturnType<Pinecone['index']>['query']>[0]);
   return (res.matches || []).flatMap((m, rank) => {
     const metadata = toMetadata(m.metadata as Record<string, unknown>);
     return metadata ? [{ id: m.id, metadata, retriever: 'lexical' as const, rank }] : [];

@@ -16,7 +16,8 @@ import type { Source } from '@/lib/types';
  * past the end of the list, and a dead chip is worse than no chip.
  */
 
-const MARKER = /\[(\d{1,2})\]/g;
+// Matches [3], [3][7] and the grouped form [3, 7] the model also produces.
+const MARKER = /\[(\d{1,2}(?:\s*,\s*\d{1,2})*)\]/g;
 
 function CitationChip({ n, source, onSelect }: { n: number; source: Source; onSelect: (s: Source) => void }) {
   return (
@@ -48,13 +49,27 @@ function linkCitations(
     MARKER.lastIndex = 0;
 
     while ((match = MARKER.exec(node)) !== null) {
-      const n = Number(match[1]);
-      const source = sources.find(s => s.n === n);
-      if (!source) continue;
+      const cited = match[1]
+        .split(',')
+        .map(part => Number(part.trim()))
+        .map(n => ({ n, source: sources.find(s => s.n === n) }))
+        .filter((c): c is { n: number; source: Source } => Boolean(c.source));
+
+      // A marker that cites nothing we hold is left as literal text rather
+      // than rendered as a chip that opens nothing.
+      if (!cited.length) continue;
+
       if (match.index > cursor) out.push(node.slice(cursor, match.index));
-      out.push(
-        <CitationChip key={`${keyPrefix}-${match.index}`} n={n} source={source} onSelect={onSelect} />
-      );
+      for (const { n, source } of cited) {
+        out.push(
+          <CitationChip
+            key={`${keyPrefix}-${match.index}-${n}`}
+            n={n}
+            source={source}
+            onSelect={onSelect}
+          />
+        );
+      }
       cursor = match.index + match[0].length;
     }
 

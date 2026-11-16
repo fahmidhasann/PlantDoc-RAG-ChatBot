@@ -150,8 +150,9 @@ async function main() {
 
   if (sparseVector) {
     const t = Date.now();
+    // A sparse index is queried with `sparseVector` alone — passing an empty
+    // `vector` alongside it is rejected by the client validator.
     const res = await pc.index(SPARSE_INDEX).namespace(NAMESPACE).query({
-      vector: [],
       sparseVector,
       topK: 15,
       includeMetadata: true,
