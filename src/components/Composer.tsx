@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { prepareImage, type PreparedImage } from '@/lib/client/image';
 
 export function Composer({
@@ -22,12 +22,43 @@ export function Composer({
   const fileRef = useRef<HTMLInputElement>(null);
 
   // Grow with the content, up to a ceiling, then scroll.
-  useEffect(() => {
+  //
+  // Measured in a layout effect so it never runs against a half-laid-out box,
+  // and re-measured when the textarea's own size changes — the wrap point
+  // moves with the width, and a stale measurement leaves the composer stuck
+  // at whatever height it happened to compute once.
+  const resize = useCallback(() => {
     const el = textareaRef.current;
     if (!el) return;
+    // An empty textarea measures its PLACEHOLDER, not its value, so a long
+    // placeholder that wraps on a narrow screen would leave the composer
+    // several lines tall with nothing typed in it. Clearing the inline height
+    // hands it back to rows={1}, which is one line whatever the placeholder does.
+    if (!el.value) {
+      el.style.height = '';
+      return;
+    }
     el.style.height = 'auto';
     el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
-  }, [value]);
+  }, []);
+
+  useLayoutEffect(resize, [value, image, resize]);
+
+  useLayoutEffect(() => {
+    const row = textareaRef.current?.parentElement;
+    if (!row || typeof ResizeObserver === 'undefined') return;
+    // The row is observed rather than the textarea itself: resizing the
+    // textarea is what this callback does, so watching it would feed back on
+    // itself. Only a width change matters — that is what moves the wrap point.
+    let lastWidth = row.clientWidth;
+    const observer = new ResizeObserver(() => {
+      if (row.clientWidth === lastWidth) return;
+      lastWidth = row.clientWidth;
+      resize();
+    });
+    observer.observe(row);
+    return () => observer.disconnect();
+  }, [resize]);
 
   useEffect(() => {
     if (!busy) textareaRef.current?.focus();
@@ -151,9 +182,9 @@ export function Composer({
               submit();
             }
           }}
-          placeholder={
-            preparing ? 'Preparing photo…' : 'Ask about a disease, a symptom, or a control measure…'
-          }
+          // Kept short so it fits one line at phone width; the empty state
+          // above already explains what can be asked.
+          placeholder={preparing ? 'Preparing photo…' : 'Ask about a disease…'}
           className="scrollbar-slim max-h-[200px] flex-1 resize-none bg-transparent py-2.5 text-[0.9375rem] leading-6 text-[var(--color-ink)] outline-none placeholder:text-[var(--color-ink-faint)]"
         />
 
