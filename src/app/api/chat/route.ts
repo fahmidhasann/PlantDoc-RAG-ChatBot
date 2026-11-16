@@ -91,6 +91,10 @@ export async function POST(req: NextRequest) {
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       let closed = false;
+      // Whether the reader has already seen part of an answer, so a failure
+      // after that point can be described as an interruption rather than as a
+      // failure to answer at all.
+      let streamedAnything = false;
       const send = (event: ChatEvent) => {
         if (closed) return;
         controller.enqueue(encoder.encode(`${JSON.stringify(event)}\n`));
@@ -110,6 +114,14 @@ export async function POST(req: NextRequest) {
           image: image ?? undefined,
           signal: req.signal,
         });
+
+        // The book is English. A non-Latin question that could not be
+        // rewritten — because the rewrite model was throttled — is about to be
+        // searched in a script the index barely matches, and will come back
+        // empty. That is a service problem, not an absent topic, and it must
+        // not be reported as one.
+        const rewriteWasNeeded = Boolean(image) || /(?=\p{L})\P{Script=Latin}/u.test(message);
+        const rewriteFailed = rewriteWasNeeded && !rewritten;
         // A photo with no question produces a search line describing what is
         // visible, which pulls back symptom passages and little else. Someone
         // who photographs a diseased plant wants to know what to do about it,
@@ -137,8 +149,9 @@ export async function POST(req: NextRequest) {
         if (!passages.length) {
           send({
             type: 'error',
-            message:
-              'Nothing in the indexed book matched that question. Try naming the crop and the symptom, or ask about a different topic.',
+            message: rewriteFailed
+              ? 'The service is busy and could not prepare the search for that question. Please try again in a few seconds.'
+              : 'Nothing in the indexed book matched that question. Try naming the crop and the symptom, or ask about a different topic.',
             recoverable: true,
           });
           finish();
@@ -166,6 +179,7 @@ export async function POST(req: NextRequest) {
 
         for await (const text of chunks) {
           if (req.signal.aborted) break;
+          streamedAnything = true;
           send({ type: 'delta', text });
         }
 
@@ -176,9 +190,11 @@ export async function POST(req: NextRequest) {
           return;
         }
         console.error('[chat] turn failed:', err);
-        const message = isPineconeFailure(err)
-          ? 'The vector index could not be reached. Check PINECONE_API_KEY and that the index has been built.'
-          : describeGeminiError(err);
+        const message = streamedAnything
+          ? 'The answer was cut short — the connection to the model dropped partway through. Ask again to get the whole thing.'
+          : isPineconeFailure(err)
+            ? 'The vector index could not be reached. Check PINECONE_API_KEY and that the index has been built.'
+            : describeGeminiError(err);
         send({ type: 'error', message, recoverable: true });
       } finally {
         finish();
