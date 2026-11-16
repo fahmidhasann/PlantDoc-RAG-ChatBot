@@ -1,221 +1,306 @@
 /**
- * Google Gemini API Client
- * Answers with Gemini 3.8 Flash, falling back through newer-to-older Flash and Flash-Lite models
- * when a model's free-tier quota is used up.
- * Text embeddings for retrieval come from Pinecone (see src/lib/pinecone.ts).
+ * Gemini client: streaming answers, query rewriting and photo reading.
+ *
+ * Three things here exist because of concrete failures in the previous version:
+ *
+ * 1. Thinking tokens are drawn from `maxOutputTokens`. Gemini 3.x Flash models
+ *    default to MEDIUM thinking, so a 4k budget could be spent entirely on
+ *    reasoning and return an empty answer. Every call below pins the thinking
+ *    level to the model's documented floor.
+ * 2. Nothing had a timeout, so a slow model could hold the request open until
+ *    the platform killed it. Every call now carries an AbortSignal.
+ * 3. Model fallback used to happen after bytes were already on the wire. The
+ *    stream here is only committed once a model has produced real text, so a
+ *    failing model is replaced invisibly instead of truncating the answer.
  */
 
-// Each model has its own free-tier daily quota (about 20 requests/day for the Flash models),
-// so trying several in turn keeps answers coming long after the first one is used up.
-const ANSWER_MODELS = [
-  "gemini-3.8-flash",
-  "gemini-3.7-flash",
-  "gemini-3.6-flash",
-  "gemini-3.5-flash",
-  "gemini-3.5-flash-lite",
-  "gemini-3.1-flash-lite"
-];
-// Turning a photo or a Bangla question into an English search line is a small task:
-// the lighter models do it well and leave the Flash quota for answers.
-const SEARCH_QUERY_MODELS = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.6-flash"];
+import { GoogleGenAI, ThinkingLevel, type Content, type Part } from '@google/genai';
+import {
+  ANSWER_MAX_TOKENS,
+  ANSWER_MODELS,
+  ANSWER_TIMEOUT_MS,
+  MIN_THINKING_LEVEL,
+  UTILITY_MAX_TOKENS,
+  UTILITY_MODELS,
+  UTILITY_TIMEOUT_MS,
+} from './config';
 
-function modelChain(models: string[]): string[] {
-  return [...new Set([process.env.GEMINI_MODEL, ...models].filter(Boolean) as string[])];
+/** Long enough for a per-minute window to free up, short enough to wait out. */
+const RATE_LIMIT_RETRY_MS = 3_000;
+
+let client: GoogleGenAI | null = null;
+
+function getClient(): GoogleGenAI {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) throw new Error('GEMINI_API_KEY is not set.');
+  if (!client) client = new GoogleGenAI({ apiKey });
+  return client;
 }
 
-export interface MultimodalPayload {
-  prompt: string;
-  contextText?: string;
-  imageBufferBase64?: string;
-  imageMimeType?: string;
+export function isGeminiConfigured(): boolean {
+  return Boolean(process.env.GEMINI_API_KEY);
+}
+
+/** gemini-3.8-flash has no MINIMAL level; its floor is LOW. */
+function thinkingFor(model: string): ThinkingLevel {
+  return MIN_THINKING_LEVEL[model] === 'low' ? ThinkingLevel.LOW : ThinkingLevel.MINIMAL;
+}
+
+function deadline(ms: number, parent?: AbortSignal): AbortSignal {
+  const timeout = AbortSignal.timeout(ms);
+  return parent ? AbortSignal.any([parent, timeout]) : timeout;
 }
 
 /**
- * Build a short English textbook search query from a non-English question and/or a leaf photo
- * (crop, likely disease, pathogen, visible symptoms). The textbook is English, so this keeps
- * retrieval sharp for Bangla questions and photo-only uploads. Returns "" if it cannot.
+ * Failure kinds, most informative first.
+ *
+ * When every model in the chain fails it is rarely for the same reason — one
+ * is rate limited, the next returns an empty answer, the last times out — and
+ * the reason worth reporting is not the one that happened last. Ranking them
+ * is what stops a rate limit being reported as "could not be reached".
  */
-export async function buildSearchQuery(payload: {
-  userQuery?: string;
-  imageBase64?: string;
-  imageMimeType?: string;
-}): Promise<string> {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) return "";
+type FailureKind = 'key' | 'rate' | 'timeout' | 'empty' | 'unknown';
 
-  const hasImage = Boolean(payload.imageBase64 && payload.imageMimeType);
-  const instruction = hasImage
-    ? `You are helping search an English plant pathology textbook. Look at this plant photo${
-        payload.userQuery ? ` (the user asks: "${payload.userQuery}")` : ""
-      } and reply with ONE English line only: the crop, the most likely disease name(s) and pathogen, and the key visible symptoms. No other text.`
-    : `You are helping search an English plant pathology textbook. Rewrite this question as ONE short English search line naming the crop, the disease and pathogen if known, and the symptoms or topic asked about. No other text.\n\nQuestion: "${payload.userQuery}"`;
+const FAILURE_RANK: Record<FailureKind, number> = {
+  key: 0,
+  rate: 1,
+  timeout: 2,
+  empty: 3,
+  unknown: 4,
+};
 
-  const parts: any[] = [];
-  if (hasImage) parts.push({ inline_data: { mime_type: payload.imageMimeType, data: payload.imageBase64 } });
-  parts.push({ text: instruction });
+export function classifyGeminiError(err: unknown): FailureKind {
+  const e = err as { message?: unknown; status?: unknown; name?: unknown };
+  const message = String(e?.message ?? err ?? '');
+  const status = Number(e?.status);
 
-  for (const model of SEARCH_QUERY_MODELS) {
-    try {
-      const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            contents: [{ role: "user", parts }],
-            generationConfig: { temperature: 0, maxOutputTokens: 256 }
-          })
-        }
-      );
-      if (!response.ok) {
-        console.warn(`Search-query rewrite with ${model} returned ${response.status}`);
-        continue;
-      }
-      const data = await response.json();
-      const text: string = (data.candidates?.[0]?.content?.parts || [])
-        .filter((part: any) => !part.thought)
-        .map((part: any) => part.text || "")
-        .join(" ")
-        .trim();
-      if (text) return text.split("\n")[0].slice(0, 300);
-    } catch (err) {
-      console.warn(`Search-query rewrite with ${model} failed:`, err);
-    }
+  if (/leaked|API key not valid|API_KEY_INVALID|PERMISSION_DENIED/i.test(message)) return 'key';
+  if (status === 403) return 'key';
+  if (status === 429 || /\b429\b|RESOURCE_EXHAUSTED|exceeded your current quota|rate limit/i.test(message)) {
+    return 'rate';
   }
-  return "";
+  if (/abort|timeout|timed out/i.test(message) || e?.name === 'AbortError' || e?.name === 'TimeoutError') {
+    return 'timeout';
+  }
+  if (/returned no text|empty answer/i.test(message)) return 'empty';
+  return 'unknown';
 }
 
-export async function generateGeminiDiagnosis(payload: {
-  userQuery: string;
-  contextChunks: string;
-  imageBase64?: string;
-  imageMimeType?: string;
-}): Promise<string> {
-  const apiKey = process.env.GEMINI_API_KEY;
-
-  const systemPrompt = `You are PlantDoc, an elite plant pathologist AI expert trained on Agrios' Plant Pathology textbook (5th Edition).
-Your mission is to provide accurate, clinical, and actionable diagnosis for plant diseases based on the provided textbook context.
-
-Guidelines:
-1. Ground your answer in the provided textbook context.
-2. When answering, cite exact page numbers (e.g., "[Agrios Plant Pathology, Page 421]").
-3. If an image is provided:
-   - Carefully inspect visual leaf symptoms (lesions, chlorosis, halo, sporulation, vein necrosis).
-   - Correlate visual findings with the retrieved textbook disease descriptions.
-4. Structure your response clearly:
-   - 🔍 **Diagnosis & Causal Organism**: Name of disease & pathogen (scientific binomial).
-   - 🌿 **Observed Symptoms**: What indicates this disease.
-   - 🛡️ **Actionable Management**:
-     - *Cultural / Sanitation*
-     - *Organic / Biological Controls*
-     - *Chemical Treatments (Active ingredients & fungicides)*
-   - 📖 **Textbook Reference**: Page number citations.
-5. If the context does not contain sufficient details, state what is known and advise consulting a local agricultural extension officer.
-6. Reply in the same language as the user's question (for example, answer Bangla questions in Bangla), keeping scientific names and chemical names in English.`;
-
-  const contents: any[] = [];
-  const parts: any[] = [];
-
-  // Add textbook context
-  parts.push({
-    text: `### Verified Textbook Context Chunks:\n${payload.contextChunks}\n\n---\n`
-  });
-
-  // If image is provided, attach inline data
-  if (payload.imageBase64 && payload.imageMimeType) {
-    parts.push({
-      inline_data: {
-        mime_type: payload.imageMimeType,
-        data: payload.imageBase64
-      }
-    });
-    parts.push({
-      text: `User uploaded a photo of an affected plant leaf. Please examine this image and answer the user's query: "${payload.userQuery || 'Diagnose the disease in this plant image and suggest treatment.'}"`
-    });
-  } else {
-    parts.push({
-      text: `User Question: "${payload.userQuery}"`
-    });
+/** Classifies an upstream failure so the caller can tell the user something true. */
+export function describeGeminiError(err: unknown): string {
+  switch (classifyGeminiError(err)) {
+    case 'key':
+      return 'The Gemini API key was rejected. Generate a fresh one at aistudio.google.com and set GEMINI_API_KEY.';
+    case 'rate':
+      return 'Gemini is rate limited right now — the free tier allows about 15 requests a minute per model, and every model in the chain is currently over. Wait a few seconds and ask again.';
+    case 'timeout':
+      return 'Gemini took too long to respond and the request was cancelled. Try again.';
+    case 'empty':
+      return 'Gemini returned an empty answer on every model. Try rephrasing the question.';
+    default:
+      return 'Gemini could not be reached. Check the server logs for the upstream error.';
   }
+}
 
-  contents.push({
-    role: "user",
-    parts: parts
-  });
+// ---------------------------------------------------------------------------
+// Streaming answers
+// ---------------------------------------------------------------------------
 
-  let lastErrorMessage = "";
+export interface AnswerStream {
+  model: string;
+  /** Yields answer text only; thought parts are filtered out upstream. */
+  chunks: AsyncGenerator<string>;
+}
 
-  if (apiKey) {
-    const modelsToTry = modelChain(ANSWER_MODELS);
+/**
+ * Starts an answer, falling through the model chain until one actually emits
+ * text. The first chunk is awaited before the generator is handed back, so a
+ * 404 on a retired model, a 429, or an empty MAX_TOKENS response is swallowed
+ * and retried on the next model with nothing shown to the user.
+ */
+export async function streamAnswer(options: {
+  system: string;
+  contents: Content[];
+  signal?: AbortSignal;
+}): Promise<AnswerStream> {
+  // The free tier's per-minute allowance is small enough that a burst of
+  // questions can exhaust every model at once. That clears in seconds, so one
+  // patient retry turns a visible failure into a short pause.
+  try {
+    return await attemptAnswer(options);
+  } catch (err) {
+    if (classifyGeminiError(err) !== 'rate' || options.signal?.aborted) throw err;
+    console.warn('[gemini] whole chain rate limited; retrying once after a pause');
+    await new Promise(resolve => setTimeout(resolve, RATE_LIMIT_RETRY_MS));
+    if (options.signal?.aborted) throw err;
+    return attemptAnswer(options);
+  }
+}
 
-    for (const model of modelsToTry) {
-      try {
-        const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-        const response = await fetch(endpoint, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            contents,
-            systemInstruction: {
-              parts: [{ text: systemPrompt }]
-            },
-            generationConfig: {
-              temperature: 0.3,
-              maxOutputTokens: 4096
-            }
-          })
-        });
+/** One pass down the model chain. */
+async function attemptAnswer(options: {
+  system: string;
+  contents: Content[];
+  signal?: AbortSignal;
+}): Promise<AnswerStream> {
+  const ai = getClient();
 
-        if (response.ok) {
-          const data = await response.json();
-          const answer = (data.candidates?.[0]?.content?.parts || [])
-            .filter((part: any) => !part.thought)
-            .map((part: any) => part.text || "")
-            .join("")
-            .trim();
-          if (answer) return answer;
-          lastErrorMessage = `Model ${model} returned an empty answer.`;
-          continue;
-        }
-
-        const errText = await response.text();
-        console.warn(`Model ${model} returned ${response.status}:`, errText);
-
-        if (errText.includes("leaked")) {
-          lastErrorMessage = "Google AI Studio has deactivated this API key because it was reported in a public leak. Please generate a fresh key at aistudio.google.com.";
-          break;
-        } else if (response.status === 429) {
-          lastErrorMessage = "Gemini API rate limit reached (15 requests/min on Free Tier). Please retry in 30 seconds.";
-        } else {
-          lastErrorMessage = `Gemini API Error (${response.status}): ${errText}`;
-        }
-      } catch (err: any) {
-        console.warn(`Model ${model} call failed:`, err);
-        lastErrorMessage = err.message || "Network error contacting Gemini API.";
-      }
+  // Keep the most informative failure seen across the whole chain, not the
+  // most recent one.
+  let bestError: unknown = new Error('No Gemini model produced an answer.');
+  let bestRank = FAILURE_RANK.unknown;
+  const noteFailure = (err: unknown) => {
+    const rank = FAILURE_RANK[classifyGeminiError(err)];
+    if (rank < bestRank) {
+      bestRank = rank;
+      bestError = err;
     }
-  } else {
-    lastErrorMessage = "GEMINI_API_KEY is not configured.";
+  };
+
+  for (const model of ANSWER_MODELS) {
+    try {
+      const stream = await ai.models.generateContentStream({
+        model,
+        contents: options.contents,
+        config: {
+          systemInstruction: options.system,
+          temperature: 0.25,
+          topP: 0.95,
+          maxOutputTokens: ANSWER_MAX_TOKENS,
+          thinkingConfig: { thinkingLevel: thinkingFor(model), includeThoughts: false },
+          abortSignal: deadline(ANSWER_TIMEOUT_MS, options.signal),
+        },
+      });
+
+      const iterator = stream[Symbol.asyncIterator]();
+
+      // Pull until the first non-empty text chunk. A model that only ever
+      // yields thought parts, or finishes on MAX_TOKENS with nothing to say,
+      // falls through to the next candidate.
+      let first: string | null = null;
+      let exhausted = false;
+      while (first === null) {
+        const next = await iterator.next();
+        if (next.done) {
+          exhausted = true;
+          break;
+        }
+        const text = next.value?.text;
+        if (text) first = text;
+      }
+
+      if (exhausted || first === null) {
+        noteFailure(new Error(`${model} returned no text.`));
+        console.warn(`[gemini] ${model} produced an empty answer; trying the next model.`);
+        continue;
+      }
+
+      const committed = first;
+      async function* chunks() {
+        yield committed;
+        while (true) {
+          const next = await iterator.next();
+          if (next.done) return;
+          const text = next.value?.text;
+          if (text) yield text;
+        }
+      }
+
+      return { model, chunks: chunks() };
+    } catch (err) {
+      noteFailure(err);
+      const kind = classifyGeminiError(err);
+      console.warn(
+        `[gemini] ${model} failed (${kind}):`,
+        String((err as Error)?.message || err).slice(0, 300)
+      );
+      // A rejected key fails identically on every model, so stop rather than
+      // burn four round trips proving it. Same for a cancelled request.
+      if (kind === 'key') break;
+      if (options.signal?.aborted) break;
+    }
   }
 
-  // Graceful Fallback: Generate structured diagnosis directly from the retrieved textbook context
-  // This guarantees the app NEVER crashes and always presents clinical answers to users!
-  const alertBanner = lastErrorMessage.includes("leaked")
-    ? `> ⚠️ **API Key Notice**: Google AI Studio has automatically deactivated the previous API key because it was detected in a public leak. A fresh key can be generated at [Google AI Studio](https://aistudio.google.com/app/apikey). In the meantime, PlantDoc is displaying direct clinical analysis from the 948-page textbook index:`
-    : lastErrorMessage.includes("rate limit")
-    ? `> ⏳ **Rate Limit Notice**: Free tier rate limit reached. Displaying grounded textbook knowledge:`
-    : `> ℹ️ **Textbook Grounding Mode**: Grounded directly in Agrios' Plant Pathology textbook database:`;
+  throw bestError;
+}
 
-  return `### 🔍 Grounded Clinical Pathology Summary
+// ---------------------------------------------------------------------------
+// Small utility calls
+// ---------------------------------------------------------------------------
 
-${alertBanner}
+/** Runs a short, literal prompt on the cheapest model that answers. */
+async function utilityCall(parts: Part[], signal?: AbortSignal): Promise<string> {
+  const ai = getClient();
+  for (const model of UTILITY_MODELS) {
+    try {
+      const res = await ai.models.generateContent({
+        model,
+        contents: [{ role: 'user', parts }],
+        config: {
+          temperature: 0,
+          maxOutputTokens: UTILITY_MAX_TOKENS,
+          thinkingConfig: { thinkingLevel: thinkingFor(model), includeThoughts: false },
+          abortSignal: deadline(UTILITY_TIMEOUT_MS, signal),
+        },
+      });
+      const text = res.text?.trim();
+      if (text) return text;
+    } catch (err) {
+      console.warn(`[gemini] utility call on ${model} failed:`, (err as Error)?.message || err);
+    }
+  }
+  return '';
+}
 
-${payload.contextChunks ? `${payload.contextChunks}` : 'No matching disease profile found for this specific query.'}
+/**
+ * Turns the user's turn into a standalone English search line.
+ *
+ * Three jobs at once, because they are the same job: resolve a follow-up
+ * against the conversation ("and what about the stems?"), translate a
+ * non-English question into the language the book is written in, and name what
+ * is visible in an uploaded photo. Retrieval quality depends almost entirely on
+ * this line, so it is worth one cheap call.
+ *
+ * Returns "" when the rewrite is unnecessary or unavailable; the caller then
+ * searches with the raw question.
+ */
+export async function buildSearchQuery(options: {
+  message: string;
+  history?: Array<{ role: string; content: string }>;
+  image?: { data: string; mimeType: string };
+  signal?: AbortSignal;
+}): Promise<string> {
+  const { message, history = [], image } = options;
 
----
+  const isLatin = !/(?=\p{L})\P{Script=Latin}/u.test(message);
+  const isFollowUp = history.length > 0;
+  // A plain English opening question is already the best possible search line.
+  if (isLatin && !isFollowUp && !image) return '';
 
-### 🛡️ General Management Principles
-* **Sanitation**: Remove and destroy infected plant debris to eliminate inoculum reservoirs.
-* **Crop Rotation**: Implement 2–3 year non-host crop rotations.
-* **Chemical Strategy**: Alternate contact protectants (e.g. Mancozeb, Copper) with systemic targeted fungicides to prevent resistance.`;
+  const transcript = history
+    .slice(-4)
+    .map(t => `${t.role === 'user' ? 'User' : 'Assistant'}: ${t.content.slice(0, 400)}`)
+    .join('\n');
+
+  const instruction = [
+    'You write search queries for an English plant pathology textbook.',
+    transcript && `Conversation so far:\n${transcript}`,
+    image
+      ? 'The user attached a photo of a plant. Identify the crop, the most likely disease and pathogen, and the visible symptoms.'
+      : '',
+    `Latest user message: "${message}"`,
+    '',
+    'Reply with ONE English line that names the crop, the disease and pathogen if identifiable, and the symptoms or topic being asked about.',
+    'Resolve any pronouns or references to earlier turns so the line stands alone.',
+    'Output the line only — no preamble, no quotes, no explanation.',
+  ]
+    .filter(Boolean)
+    .join('\n');
+
+  const parts: Part[] = [];
+  if (image) parts.push({ inlineData: { mimeType: image.mimeType, data: image.data } });
+  parts.push({ text: instruction });
+
+  const text = await utilityCall(parts, options.signal);
+  return text ? text.split('\n')[0].slice(0, 320) : '';
 }

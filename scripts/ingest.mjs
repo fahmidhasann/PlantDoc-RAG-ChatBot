@@ -1,16 +1,18 @@
 /**
- * PlantDoc — embed textbook chunks and upsert them into Pinecone.
+ * PlantDoc — build the dense and sparse indexes from extracted chunks.
  *
- * Usage:
- *   npm run extract -- <textbook.pdf>   # writes data/processed/chunks.json
- *   npm run ingest                      # embeds + upserts every chunk
- *   npm run ingest -- --fresh           # wipe the index namespace first (removes old vectors)
+ *   npm run extract -- <book.pdf>   # writes data/processed/chunks.json
+ *   npm run ingest                  # embeds + upserts into both indexes
+ *   npm run ingest -- --fresh       # wipe the namespace first
+ *   npm run ingest -- --dense-only  # skip the lexical index
  *
- * Embeddings come from Pinecone's hosted `llama-text-embed-v2` model (768 dims, multilingual),
- * which is included in the free Starter plan — no Gemini quota is used for search.
- * PINECONE_API_KEY comes from the environment (.env.local is loaded by the npm script).
- * Embeddings are cached in data/processed/embeddings.jsonl, keyed by model + chunk text,
- * so re-running resumes where it stopped and re-extracting only re-embeds changed chunks.
+ * Both embedding models are hosted by Pinecone, so ingestion needs only
+ * PINECONE_API_KEY — no Gemini quota is consumed and nothing has to run on
+ * this machine but the PDF parsing.
+ *
+ * Embeddings are cached in data/processed/embeddings.jsonl, keyed by model and
+ * chunk text. Re-running resumes where it stopped, and re-extracting only
+ * re-embeds the chunks whose text actually changed.
  */
 
 import { Pinecone } from '@pinecone-database/pinecone';
@@ -18,58 +20,56 @@ import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
-const PINECONE_API_KEY = process.env.PINECONE_API_KEY;
-const PINECONE_INDEX_NAME = process.env.PINECONE_INDEX_NAME || 'plantdoc-book';
-const EMBED_MODEL = 'llama-text-embed-v2'; // keep in sync with src/lib/pinecone.ts
-const DIMENSION = 768;
-const EMBED_BATCH = 96; // model maximum per request
-const UPSERT_BATCH = 100; // records per Pinecone upsert (keeps requests well under 2 MB)
-const MAX_METADATA_TEXT = 3000; // chars of chunk text stored for retrieval (Pinecone allows 40 KB)
+// Keep in sync with src/lib/config.ts.
+const DENSE_INDEX = process.env.PINECONE_DENSE_INDEX || 'plantdoc-dense';
+const SPARSE_INDEX = process.env.PINECONE_SPARSE_INDEX || 'plantdoc-sparse';
+const NAMESPACE = process.env.PINECONE_NAMESPACE || 'default';
+const DENSE_MODEL = 'llama-text-embed-v2';
+const DENSE_DIMENSION = 1024;
+const SPARSE_MODEL = 'pinecone-sparse-english-v0';
+const CLOUD = 'aws';
+const REGION = 'us-east-1';
+
+const EMBED_BATCH = 96; // hosted-model maximum per request
+const UPSERT_BATCH = 100; // keeps each request well under 2 MB
+const MAX_METADATA_TEXT = 3500; // Pinecone allows 40 KB; chunks are ~1.5 KB
 
 const CHUNKS_PATH = path.resolve('data/processed/chunks.json');
+const FIGURES_PATH = path.resolve('data/processed/figures.json');
 const CACHE_PATH = path.resolve('data/processed/embeddings.jsonl');
 
 const args = new Set(process.argv.slice(2));
 const FRESH = args.has('--fresh');
+const DENSE_ONLY = args.has('--dense-only');
 
-if (!PINECONE_API_KEY) {
-  console.error('❌ PINECONE_API_KEY must be set (put it in .env.local).');
+const API_KEY = process.env.PINECONE_API_KEY;
+if (!API_KEY) {
+  console.error('PINECONE_API_KEY must be set (put it in .env.local).');
   process.exit(1);
 }
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+const fmt = n => n.toLocaleString('en-US');
 
+/**
+ * What actually gets embedded. Prefixing each chunk with its chapter and
+ * section heading is cheap contextual retrieval: a passage reading "Symptoms
+ * appear first on lower leaves" is nearly meaningless as a standalone vector,
+ * but "Chapter 11 — Late Blight of Potato: Symptoms appear first on lower
+ * leaves" lands in the right neighbourhood.
+ */
 function embeddingText(chunk) {
-  const heading = [chunk.chapter, chunk.topic !== chunk.chapter ? chunk.topic : null].filter(Boolean).join(' — ');
+  const heading = [chunk.chapter, chunk.topic !== chunk.chapter ? chunk.topic : null]
+    .filter(Boolean)
+    .join(' — ');
   return `${heading}\n${chunk.text || chunk.content || ''}`;
 }
 
-function cacheKey(chunk) {
-  return createHash('sha256').update(`${EMBED_MODEL}|${DIMENSION}|${embeddingText(chunk)}`).digest('hex').slice(0, 32);
-}
-
-async function embedBatch(pinecone, chunks) {
-  for (let attempt = 1; attempt <= 10; attempt++) {
-    try {
-      const res = await pinecone.inference.embed({
-        model: EMBED_MODEL,
-        inputs: chunks.map(embeddingText),
-        parameters: { inputType: 'passage', truncate: 'END', dimension: DIMENSION }
-      });
-      const vectors = res.data.map(d => d.values);
-      if (vectors.length !== chunks.length || vectors.some(v => v?.length !== DIMENSION)) {
-        throw new Error('Unexpected embedding response shape.');
-      }
-      return vectors;
-    } catch (err) {
-      const msg = String(err?.message || err);
-      const retryable = /429|rate|quota|too many|RESOURCE_EXHAUSTED|5\d\d|timeout|ECONNRESET|fetch failed/i.test(msg);
-      if (!retryable || attempt === 10) throw err;
-      const wait = Math.min(60, 5 * 2 ** (attempt - 1)) * 1000;
-      console.warn(`⏳ Embedding retry in ${wait / 1000}s (attempt ${attempt}/10): ${msg.slice(0, 160)}`);
-      await sleep(wait);
-    }
-  }
+function cacheKey(chunk, model, dimension) {
+  return createHash('sha256')
+    .update(`${model}|${dimension}|${embeddingText(chunk)}`)
+    .digest('hex')
+    .slice(0, 32);
 }
 
 function loadCache() {
@@ -78,120 +78,273 @@ function loadCache() {
   for (const line of fs.readFileSync(CACHE_PATH, 'utf8').split('\n')) {
     if (!line.trim()) continue;
     try {
-      const { key, values } = JSON.parse(line);
-      if (key && Array.isArray(values) && values.length === DIMENSION) cache.set(key, values);
+      const entry = JSON.parse(line);
+      if (entry.key) cache.set(entry.key, entry);
     } catch {
-      // ignore a partially written last line
+      // A partially written final line from an interrupted run; ignore it.
     }
   }
   return cache;
 }
 
-async function ensureIndex(pinecone) {
-  const existing = await pinecone.listIndexes();
-  const found = existing.indexes?.find(idx => idx.name === PINECONE_INDEX_NAME);
+/** Hosted inference is rate limited per minute; back off rather than fail. */
+async function withRetry(label, fn) {
+  for (let attempt = 1; attempt <= 8; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      const msg = String(err?.message || err);
+      const retryable =
+        /429|rate|quota|too many|RESOURCE_EXHAUSTED|5\d\d|timeout|ECONNRESET|fetch failed/i.test(msg);
+      if (!retryable || attempt === 8) throw err;
+      const wait = Math.min(60, 5 * 2 ** (attempt - 1));
+      console.warn(`   ${label} retry in ${wait}s (${attempt}/8): ${msg.slice(0, 140)}`);
+      await sleep(wait * 1000);
+    }
+  }
+}
+
+async function embedDenseBatch(pc, chunks) {
+  const res = await withRetry('dense embed', () =>
+    pc.inference.embed({
+      model: DENSE_MODEL,
+      inputs: chunks.map(embeddingText),
+      parameters: { inputType: 'passage', truncate: 'END', dimension: DENSE_DIMENSION },
+    })
+  );
+  const vectors = res.data.map(d => d.values);
+  if (vectors.length !== chunks.length || vectors.some(v => v?.length !== DENSE_DIMENSION)) {
+    throw new Error('Dense embedding response had an unexpected shape.');
+  }
+  return vectors;
+}
+
+async function embedSparseBatch(pc, chunks) {
+  const res = await withRetry('sparse embed', () =>
+    pc.inference.embed({
+      model: SPARSE_MODEL,
+      inputs: chunks.map(embeddingText),
+      // 2048 is the model's ceiling; chunks are far shorter, but a long one
+      // should be covered whole rather than silently clipped at the 512
+      // default. The SDK types parameters as strings; the API wants a number.
+      parameters: {
+        inputType: 'passage',
+        truncate: 'END',
+        max_tokens_per_sequence: 2048,
+      },
+    })
+  );
+  const rows = res.data.map(d => ({ indices: d.sparseIndices, values: d.sparseValues }));
+  if (rows.length !== chunks.length || rows.some(r => !r.indices?.length)) {
+    throw new Error('Sparse embedding response had an unexpected shape.');
+  }
+  return rows;
+}
+
+async function ensureIndex(pc, { name, vectorType, dimension, metric, model }) {
+  const existing = await pc.listIndexes();
+  const found = existing.indexes?.find(i => i.name === name);
+
   if (found) {
-    if (found.dimension !== DIMENSION) {
-      throw new Error(`Index "${PINECONE_INDEX_NAME}" has dimension ${found.dimension}, expected ${DIMENSION}.`);
+    if (dimension && found.dimension && found.dimension !== dimension) {
+      throw new Error(
+        `Index "${name}" has dimension ${found.dimension}, expected ${dimension}. ` +
+          `Delete it or set a different index name.`
+      );
     }
-    const model = found.tags?.embed_model;
-    if (model && model !== EMBED_MODEL) {
-      throw new Error(`Index "${PINECONE_INDEX_NAME}" was built with ${model}; use a new index name for ${EMBED_MODEL}.`);
+    const tagged = found.tags?.embed_model;
+    if (tagged && tagged !== model) {
+      throw new Error(
+        `Index "${name}" was built with "${tagged}" but this run uses "${model}". ` +
+          `Use a different index name, or delete the index and re-ingest.`
+      );
     }
-    if (!model && !FRESH) {
-      throw new Error(`Index "${PINECONE_INDEX_NAME}" has no embed_model tag (likely built with another model). Re-run with --fresh to rebuild it.`);
+    if (!tagged) {
+      await pc.configureIndex({ name, tags: { embed_model: model } }).catch(() => {});
     }
-    if (!model) await pinecone.configureIndex({ name: PINECONE_INDEX_NAME, tags: { embed_model: EMBED_MODEL } });
-    console.log(`✅ Index "${PINECONE_INDEX_NAME}" exists.`);
+    console.log(`   index "${name}" ready (${vectorType})`);
     return;
   }
-  console.log(`📦 Creating serverless index "${PINECONE_INDEX_NAME}" (dim ${DIMENSION}, cosine, aws us-east-1 — free Starter plan region)...`);
-  await pinecone.createIndex({
-    name: PINECONE_INDEX_NAME,
-    dimension: DIMENSION,
-    metric: 'cosine',
-    spec: { serverless: { cloud: 'aws', region: 'us-east-1' } },
-    tags: { embed_model: EMBED_MODEL },
-    waitUntilReady: true
+
+  console.log(`   creating ${vectorType} index "${name}" in ${CLOUD}/${REGION}...`);
+  await pc.createIndex({
+    name,
+    vectorType,
+    ...(dimension ? { dimension } : {}),
+    ...(metric ? { metric } : {}),
+    spec: { serverless: { cloud: CLOUD, region: REGION } },
+    tags: { embed_model: model },
+    waitUntilReady: true,
   });
-  console.log('✅ Index is ready.');
+  console.log(`   index "${name}" created`);
+}
+
+async function upsertAll(index, records, label) {
+  for (let i = 0; i < records.length; i += UPSERT_BATCH) {
+    const batch = records.slice(i, i + UPSERT_BATCH);
+    await withRetry(`${label} upsert`, () => index.upsert({ records: batch }));
+    process.stdout.write(`\r   ${label}: ${fmt(Math.min(i + UPSERT_BATCH, records.length))}/${fmt(records.length)}`);
+  }
+  process.stdout.write('\n');
 }
 
 async function main() {
-  console.log('🌿 PlantDoc ingestion starting...');
+  console.log('PlantDoc ingestion\n');
 
   if (!fs.existsSync(CHUNKS_PATH)) {
-    console.error(`❌ ${CHUNKS_PATH} not found. Run: npm run extract -- <path/to/textbook.pdf>`);
+    console.error(`${CHUNKS_PATH} not found.`);
+    console.error('Run: npm run extract -- <path/to/book.pdf>');
     process.exit(1);
   }
+
   const chunks = JSON.parse(fs.readFileSync(CHUNKS_PATH, 'utf8'));
-  const pages = new Set();
-  for (const c of chunks) {
-    const start = c.pdfPage ?? c.page;
-    const span = Math.max(0, (c.pageEnd ?? c.page) - (c.page ?? 0));
-    for (let p = start; p <= start + span; p++) pages.add(p);
+
+  // Figures join the corpus as ordinary chunks whose text is the printed
+  // caption plus the vision model's description of what is actually visible.
+  // That is what makes a plate findable by the symptom someone can see but
+  // cannot name.
+  if (fs.existsSync(FIGURES_PATH)) {
+    const figures = JSON.parse(fs.readFileSync(FIGURES_PATH, 'utf8'));
+    let added = 0;
+    for (const f of figures) {
+      if (!f.description) continue; // not yet described, or nothing to index
+      const heading = f.label || 'Figure';
+      chunks.push({
+        id: f.id,
+        page: Number(f.page || f.pdfPage || 0),
+        pageEnd: Number(f.page || f.pdfPage || 0),
+        pdfPage: Number(f.pdfPage || 0),
+        chapter: f.chapter || '',
+        topic: f.caption ? `${heading}: ${f.caption.slice(0, 80)}` : heading,
+        kind: 'figure',
+        text: [f.label, f.caption, f.description].filter(Boolean).join('. '),
+        image: f.image || '',
+      });
+      added++;
+    }
+    if (added) console.log(`${fmt(added)} described figures folded in`);
   }
-  console.log(`📖 ${chunks.length} chunks covering ${pages.size} PDF pages`);
 
-  const pinecone = new Pinecone({ apiKey: PINECONE_API_KEY });
-  await ensureIndex(pinecone);
-  const index = pinecone.index(PINECONE_INDEX_NAME);
+  const byKind = chunks.reduce((acc, c) => ((acc[c.kind] = (acc[c.kind] || 0) + 1), acc), {});
+  console.log(`${fmt(chunks.length)} chunks  ${JSON.stringify(byKind)}`);
+  console.log(`namespace "${NAMESPACE}"\n`);
 
-  // 1. Embed (resumable).
+  const pc = new Pinecone({ apiKey: API_KEY });
+
+  console.log('1. Indexes');
+  await ensureIndex(pc, {
+    name: DENSE_INDEX,
+    vectorType: 'dense',
+    dimension: DENSE_DIMENSION,
+    metric: 'cosine',
+    model: DENSE_MODEL,
+  });
+  if (!DENSE_ONLY) {
+    await ensureIndex(pc, { name: SPARSE_INDEX, vectorType: 'sparse', model: SPARSE_MODEL });
+  }
+
+  // -------------------------------------------------------------------------
+  // 2. Embed (resumable)
+  // -------------------------------------------------------------------------
+  console.log('\n2. Embeddings');
   const cache = loadCache();
-  const keys = new Map(chunks.map(c => [c.id, cacheKey(c)]));
-  const todo = chunks.filter(c => !cache.has(keys.get(c.id)));
-  console.log(`🧠 ${cache.size} embeddings cached, ${todo.length} to embed with ${EMBED_MODEL}`);
+  const denseKeys = new Map(chunks.map(c => [c.id, cacheKey(c, DENSE_MODEL, DENSE_DIMENSION)]));
+  const sparseKeys = new Map(chunks.map(c => [c.id, cacheKey(c, SPARSE_MODEL, 0)]));
+
   const out = fs.createWriteStream(CACHE_PATH, { flags: 'a' });
-  for (let i = 0; i < todo.length; i += EMBED_BATCH) {
-    const batch = todo.slice(i, i + EMBED_BATCH);
-    const vectors = await embedBatch(pinecone, batch);
-    batch.forEach((c, j) => {
-      cache.set(keys.get(c.id), vectors[j]);
-      out.write(`${JSON.stringify({ key: keys.get(c.id), values: vectors[j] })}\n`);
-    });
-    console.log(`✨ Embedded ${Math.min(i + EMBED_BATCH, todo.length)}/${todo.length}`);
+  const record = entry => {
+    cache.set(entry.key, entry);
+    out.write(`${JSON.stringify(entry)}\n`);
+  };
+
+  const denseTodo = chunks.filter(c => !cache.has(denseKeys.get(c.id)));
+  console.log(`   dense:  ${fmt(chunks.length - denseTodo.length)} cached, ${fmt(denseTodo.length)} to embed`);
+  for (let i = 0; i < denseTodo.length; i += EMBED_BATCH) {
+    const batch = denseTodo.slice(i, i + EMBED_BATCH);
+    const vectors = await embedDenseBatch(pc, batch);
+    batch.forEach((c, j) => record({ key: denseKeys.get(c.id), values: vectors[j] }));
+    process.stdout.write(`\r   dense:  ${fmt(Math.min(i + EMBED_BATCH, denseTodo.length))}/${fmt(denseTodo.length)}`);
   }
+  if (denseTodo.length) process.stdout.write('\n');
+
+  if (!DENSE_ONLY) {
+    const sparseTodo = chunks.filter(c => !cache.has(sparseKeys.get(c.id)));
+    console.log(`   sparse: ${fmt(chunks.length - sparseTodo.length)} cached, ${fmt(sparseTodo.length)} to embed`);
+    for (let i = 0; i < sparseTodo.length; i += EMBED_BATCH) {
+      const batch = sparseTodo.slice(i, i + EMBED_BATCH);
+      const rows = await embedSparseBatch(pc, batch);
+      batch.forEach((c, j) =>
+        record({ key: sparseKeys.get(c.id), indices: rows[j].indices, values: rows[j].values })
+      );
+      process.stdout.write(`\r   sparse: ${fmt(Math.min(i + EMBED_BATCH, sparseTodo.length))}/${fmt(sparseTodo.length)}`);
+    }
+    if (sparseTodo.length) process.stdout.write('\n');
+  }
+
   await new Promise(r => out.end(r));
 
-  // 2. Upsert everything that has an embedding.
+  // -------------------------------------------------------------------------
+  // 3. Upsert
+  // -------------------------------------------------------------------------
+  console.log('\n3. Upsert');
+
+  const metadataFor = c => ({
+    page: Number(c.page || 0),
+    pageEnd: Number(c.pageEnd || c.page || 0),
+    pdfPage: Number(c.pdfPage || c.page || 0),
+    chapter: String(c.chapter || ''),
+    topic: String(c.topic || ''),
+    kind: String(c.kind || 'body'),
+    text: String(c.text || c.content || '').slice(0, MAX_METADATA_TEXT),
+    // Only set when the book's licence allowed the plate to be published.
+    ...(c.image ? { image: String(c.image) } : {}),
+  });
+
+  const denseIdx = pc.index(DENSE_INDEX).namespace(NAMESPACE);
+  const sparseIdx = pc.index(SPARSE_INDEX).namespace(NAMESPACE);
+
   if (FRESH) {
-    console.log('🧹 --fresh: deleting all existing vectors in the default namespace...');
-    await index.deleteAll().catch(err => {
-      if (!/not ?found/i.test(String(err))) throw err;
-    });
+    console.log(`   --fresh: clearing namespace "${NAMESPACE}"`);
+    const ignoreMissing = err => {
+      if (!/not ?found|404/i.test(String(err))) throw err;
+    };
+    await denseIdx.deleteAll().catch(ignoreMissing);
+    if (!DENSE_ONLY) await sparseIdx.deleteAll().catch(ignoreMissing);
   }
 
-  const ready = chunks.filter(c => cache.has(keys.get(c.id)));
-  console.log(`📡 Upserting ${ready.length} vectors to "${PINECONE_INDEX_NAME}"...`);
-  for (let i = 0; i < ready.length; i += UPSERT_BATCH) {
-    const records = ready.slice(i, i + UPSERT_BATCH).map(c => ({
-      id: c.id,
-      values: cache.get(keys.get(c.id)),
-      metadata: {
-        page: Number(c.page || 0),
-        pageEnd: Number(c.pageEnd || c.page || 0),
-        pdfPage: Number(c.pdfPage || c.page || 0),
-        chapter: String(c.chapter || ''),
-        topic: String(c.topic || ''),
-        kind: String(c.kind || 'body'),
-        text: String(c.text || c.content || '').slice(0, MAX_METADATA_TEXT)
-      }
-    }));
-    await index.upsert({ records });
-    process.stdout.write(`\r   ${Math.min(i + UPSERT_BATCH, ready.length)}/${ready.length}`);
+  const denseRecords = chunks
+    .filter(c => cache.has(denseKeys.get(c.id)))
+    .map(c => ({ id: c.id, values: cache.get(denseKeys.get(c.id)).values, metadata: metadataFor(c) }));
+  await upsertAll(denseIdx, denseRecords, 'dense ');
+
+  if (!DENSE_ONLY) {
+    const sparseRecords = chunks
+      .filter(c => cache.has(sparseKeys.get(c.id)))
+      .map(c => {
+        const entry = cache.get(sparseKeys.get(c.id));
+        return {
+          id: c.id,
+          sparseValues: { indices: entry.indices, values: entry.values },
+          metadata: metadataFor(c),
+        };
+      });
+    await upsertAll(sparseIdx, sparseRecords, 'sparse');
   }
-  process.stdout.write('\n');
 
-  // Serverless stats are eventually consistent; give them a moment.
-  await sleep(5000);
-  const stats = await index.describeIndexStats();
-  console.log(`📊 Index now holds ${stats.totalRecordCount ?? stats.totalVectorCount} vectors.`);
+  // Serverless stats are eventually consistent.
+  console.log('\n4. Verifying');
+  await sleep(6000);
+  const denseStats = await denseIdx.describeIndexStats();
+  console.log(`   ${DENSE_INDEX}: ${fmt(denseStats.totalRecordCount ?? 0)} vectors`);
+  if (!DENSE_ONLY) {
+    const sparseStats = await sparseIdx.describeIndexStats();
+    console.log(`   ${SPARSE_INDEX}: ${fmt(sparseStats.totalRecordCount ?? 0)} vectors`);
+  }
 
-  console.log('🎉 Ingestion complete — the full textbook is searchable.');
+  console.log('\nDone. Run `npm run doctor` to sanity-check retrieval.');
 }
 
 main().catch(err => {
-  console.error('Fatal ingestion error:', err);
+  console.error('\nIngestion failed:', err);
   process.exit(1);
 });
