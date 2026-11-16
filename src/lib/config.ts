@@ -58,7 +58,7 @@ export const MIN_RERANK_SCORE = 0.02;
  * the bibliography and the back-of-book index — but those are navigation aids,
  * not explanations, so they never crowd out real prose.
  */
-export const ANSWERABLE_KINDS = ['body', 'glossary', 'front'] as const;
+export const ANSWERABLE_KINDS = ['body', 'glossary', 'front', 'figure'] as const;
 
 // ---------------------------------------------------------------------------
 // Generation

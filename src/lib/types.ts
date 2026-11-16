@@ -11,9 +11,15 @@ export interface PassageMetadata {
   chapter: string;
   /** Nearest section or disease heading above the passage. */
   topic: string;
-  /** body | references | glossary | index | toc | front */
+  /** body | references | glossary | index | toc | front | figure */
   kind: string;
   text: string;
+  /**
+   * Public path to the plate, for `kind: 'figure'` only, and only when the
+   * book's licence allowed the image itself to be published. Figures are
+   * indexed and cited either way; the picture is the optional part.
+   */
+  image?: string;
 }
 
 /** A retrieved passage, after fusion and reranking. */
@@ -39,6 +45,10 @@ export interface Source {
   excerpt: string;
   score?: number;
   retrievers: Array<'semantic' | 'lexical'>;
+  /** Marks a source that came from a plate rather than running text. */
+  isFigure?: boolean;
+  /** Public path to the plate, when it was publishable. */
+  image?: string;
 }
 
 /** One line of the NDJSON stream from /api/chat. */

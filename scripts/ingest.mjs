@@ -35,6 +35,7 @@ const UPSERT_BATCH = 100; // keeps each request well under 2 MB
 const MAX_METADATA_TEXT = 3500; // Pinecone allows 40 KB; chunks are ~1.5 KB
 
 const CHUNKS_PATH = path.resolve('data/processed/chunks.json');
+const FIGURES_PATH = path.resolve('data/processed/figures.json');
 const CACHE_PATH = path.resolve('data/processed/embeddings.jsonl');
 
 const args = new Set(process.argv.slice(2));
@@ -197,6 +198,33 @@ async function main() {
   }
 
   const chunks = JSON.parse(fs.readFileSync(CHUNKS_PATH, 'utf8'));
+
+  // Figures join the corpus as ordinary chunks whose text is the printed
+  // caption plus the vision model's description of what is actually visible.
+  // That is what makes a plate findable by the symptom someone can see but
+  // cannot name.
+  if (fs.existsSync(FIGURES_PATH)) {
+    const figures = JSON.parse(fs.readFileSync(FIGURES_PATH, 'utf8'));
+    let added = 0;
+    for (const f of figures) {
+      if (!f.description) continue; // not yet described, or nothing to index
+      const heading = f.label || 'Figure';
+      chunks.push({
+        id: f.id,
+        page: Number(f.page || f.pdfPage || 0),
+        pageEnd: Number(f.page || f.pdfPage || 0),
+        pdfPage: Number(f.pdfPage || 0),
+        chapter: f.chapter || '',
+        topic: f.caption ? `${heading}: ${f.caption.slice(0, 80)}` : heading,
+        kind: 'figure',
+        text: [f.label, f.caption, f.description].filter(Boolean).join('. '),
+        image: f.image || '',
+      });
+      added++;
+    }
+    if (added) console.log(`${fmt(added)} described figures folded in`);
+  }
+
   const byKind = chunks.reduce((acc, c) => ((acc[c.kind] = (acc[c.kind] || 0) + 1), acc), {});
   console.log(`${fmt(chunks.length)} chunks  ${JSON.stringify(byKind)}`);
   console.log(`namespace "${NAMESPACE}"\n`);
@@ -268,6 +296,8 @@ async function main() {
     topic: String(c.topic || ''),
     kind: String(c.kind || 'body'),
     text: String(c.text || c.content || '').slice(0, MAX_METADATA_TEXT),
+    // Only set when the book's licence allowed the plate to be published.
+    ...(c.image ? { image: String(c.image) } : {}),
   });
 
   const denseIdx = pc.index(DENSE_INDEX).namespace(NAMESPACE);

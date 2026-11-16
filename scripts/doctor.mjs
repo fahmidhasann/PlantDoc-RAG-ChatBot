@@ -17,7 +17,7 @@ const DENSE_MODEL = 'llama-text-embed-v2';
 const DENSE_DIMENSION = 1024;
 const SPARSE_MODEL = 'pinecone-sparse-english-v0';
 const RERANK_MODEL = 'bge-reranker-v2-m3';
-const ANSWERABLE_KINDS = ['body', 'glossary', 'front'];
+const ANSWERABLE_KINDS = ['body', 'glossary', 'front', 'figure'];
 const RRF_K = 60;
 
 const QUERY =

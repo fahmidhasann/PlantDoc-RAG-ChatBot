@@ -85,7 +85,21 @@ export function SourcePanel({
         </header>
 
         <div className="scrollbar-slim flex-1 overflow-y-auto px-5 py-4">
+          {source.image && (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img
+              src={source.image}
+              alt={source.topic || `Figure on page ${source.page}`}
+              className="mb-3 w-full rounded-lg border border-[var(--color-line)] bg-[var(--color-surface-sunken)] object-contain"
+            />
+          )}
+
           <div className="mb-3 flex flex-wrap items-center gap-1.5">
+            {source.isFigure && (
+              <span className="rounded-full border border-[var(--color-cite)]/30 bg-[var(--color-cite-soft)] px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-[var(--color-cite)]">
+                figure
+              </span>
+            )}
             {source.retrievers.map(r => (
               <span
                 key={r}
@@ -104,6 +118,13 @@ export function SourcePanel({
           <p className="font-serif text-[0.95rem] leading-[1.75] text-[var(--color-ink-soft)] whitespace-pre-wrap">
             {source.excerpt}
           </p>
+
+          {source.isFigure && !source.image && (
+            <p className="mt-3 border-t border-[var(--color-line)] pt-2.5 text-[11px] leading-relaxed text-[var(--color-ink-faint)]">
+              This is a description of an illustration in the book. The plate itself is not
+              reproduced here — look it up on page {source.page}.
+            </p>
+          )}
         </div>
 
         {all.length > 1 && (

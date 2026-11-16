@@ -2,7 +2,7 @@
   "name": "plantdoc-ai",
   "version": "3.0.0",
   "private": true,
-  "description": "PlantDoc — grounded plant pathology assistant: hybrid retrieval over a textbook, reranked and cited",
+  "description": "PlantDoc \u2014 grounded plant pathology assistant: hybrid retrieval over a textbook, reranked and cited",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
@@ -12,7 +12,9 @@
     "ingest": "node --env-file-if-exists=.env.local scripts/ingest.mjs",
     "index-book": "node --env-file-if-exists=.env.local scripts/index-book.mjs",
     "export-index": "node --env-file-if-exists=.env.local scripts/export-index.mjs",
-    "doctor": "node --env-file-if-exists=.env.local scripts/doctor.mjs"
+    "doctor": "node --env-file-if-exists=.env.local scripts/doctor.mjs",
+    "extract-figures": "node --env-file-if-exists=.env.local scripts/extract-figures.mjs",
+    "caption-figures": "node --env-file-if-exists=.env.local scripts/caption-figures.mjs"
   },
   "dependencies": {
     "@google/genai": "^3.3.0",

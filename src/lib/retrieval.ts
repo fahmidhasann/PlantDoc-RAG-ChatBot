@@ -128,6 +128,7 @@ function toMetadata(raw: Record<string, unknown> | undefined): PassageMetadata |
     topic: (raw?.topic as string) || '',
     kind: (raw?.kind as string) || 'body',
     text,
+    image: (raw?.image as string) || undefined,
   };
 }
 

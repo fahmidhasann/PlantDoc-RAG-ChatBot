@@ -20,6 +20,7 @@ GROUNDING
 - If the excerpts only partly cover the question, answer the part they cover, then say plainly which part the book does not address.
 - If the excerpts do not answer the question at all, say so in one sentence and suggest what to ask instead. Never fill the gap from memory.
 - Never invent a page number. Page numbers come from the excerpt headers, nothing else.
+- An excerpt marked FIGURE is a description of an illustration, not the book's prose. Cite it for what something looks like, and point the reader to it by name ("the plate on page 424 shows..."). Never take a treatment, dose or threshold from a figure description.
 
 WHEN A PHOTO IS ATTACHED
 - Describe what is actually visible: lesion shape, margin, colour, distribution on the leaf, any sporulation or halo.
@@ -50,7 +51,10 @@ export function buildContextBlock(passages: Passage[]): string {
       const pages =
         p.pageEnd && p.pageEnd !== p.page ? `pages ${p.page}-${p.pageEnd}` : `page ${p.page}`;
       const heading = [p.chapter, p.topic].filter(Boolean).join(' / ');
-      return `[${i + 1}] (${pages}${heading ? ` — ${heading}` : ''})\n${p.text}`;
+      // Figures are described, not transcribed, so the model is told which is
+      // which — a plate supports "what it looks like", not "what to spray".
+      const sort = p.kind === 'figure' ? 'FIGURE — description of a plate' : null;
+      return `[${i + 1}] (${pages}${heading ? ` — ${heading}` : ''}${sort ? ` — ${sort}` : ''})\n${p.text}`;
     })
     .join('\n\n');
 }
@@ -67,6 +71,8 @@ export function buildSources(passages: Passage[]): Source[] {
     excerpt: p.text,
     score: p.score,
     retrievers: p.retrievers,
+    isFigure: p.kind === 'figure',
+    image: p.image,
   }));
 }
 
