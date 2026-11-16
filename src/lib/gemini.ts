@@ -19,6 +19,7 @@ import {
   ANSWER_MAX_TOKENS,
   ANSWER_MODELS,
   ANSWER_TIMEOUT_MS,
+  FIRST_TOKEN_TIMEOUT_MS,
   MIN_THINKING_LEVEL,
   UTILITY_MAX_TOKENS,
   UTILITY_MODELS,
@@ -158,6 +159,26 @@ async function attemptAnswer(options: {
   };
 
   for (const model of ANSWER_MODELS) {
+    // Two deadlines on one controller: a tight one until the model says
+    // anything, then a generous one for the rest of the stream.
+    const controller = new AbortController();
+    const abortWith = (reason: string) => () => controller.abort(new Error(reason));
+    const onParentAbort = abortWith('cancelled');
+    options.signal?.addEventListener('abort', onParentAbort, { once: true });
+    let firstTokenTimer: ReturnType<typeof setTimeout> | undefined = setTimeout(
+      abortWith(`${model} produced nothing within ${FIRST_TOKEN_TIMEOUT_MS}ms`),
+      FIRST_TOKEN_TIMEOUT_MS
+    );
+    const overallTimer = setTimeout(
+      abortWith(`${model} exceeded ${ANSWER_TIMEOUT_MS}ms`),
+      ANSWER_TIMEOUT_MS
+    );
+    const release = () => {
+      clearTimeout(firstTokenTimer);
+      clearTimeout(overallTimer);
+      options.signal?.removeEventListener('abort', onParentAbort);
+    };
+
     try {
       const stream = await ai.models.generateContentStream({
         model,
@@ -168,7 +189,7 @@ async function attemptAnswer(options: {
           topP: 0.95,
           maxOutputTokens: ANSWER_MAX_TOKENS,
           thinkingConfig: { thinkingLevel: thinkingFor(model), includeThoughts: false },
-          abortSignal: deadline(ANSWER_TIMEOUT_MS, options.signal),
+          abortSignal: controller.signal,
         },
       });
 
@@ -190,24 +211,35 @@ async function attemptAnswer(options: {
       }
 
       if (exhausted || first === null) {
+        release();
         noteFailure(new Error(`${model} returned no text.`));
         console.warn(`[gemini] ${model} produced an empty answer; trying the next model.`);
         continue;
       }
 
+      // The model is talking: the first-token deadline has done its job and
+      // must not fire part-way through the answer.
+      clearTimeout(firstTokenTimer);
+      firstTokenTimer = undefined;
+
       const committed = first;
       async function* chunks() {
-        yield committed;
-        while (true) {
-          const next = await iterator.next();
-          if (next.done) return;
-          const text = next.value?.text;
-          if (text) yield text;
+        try {
+          yield committed;
+          while (true) {
+            const next = await iterator.next();
+            if (next.done) return;
+            const text = next.value?.text;
+            if (text) yield text;
+          }
+        } finally {
+          release();
         }
       }
 
       return { model, chunks: chunks() };
     } catch (err) {
+      release();
       noteFailure(err);
       const kind = classifyGeminiError(err);
       console.warn(

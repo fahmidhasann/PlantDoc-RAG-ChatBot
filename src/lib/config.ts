@@ -97,8 +97,22 @@ export const MIN_THINKING_LEVEL: Record<string, 'minimal' | 'low'> = {
 export const ANSWER_MAX_TOKENS = 3072;
 export const UTILITY_MAX_TOKENS = 256;
 
-/** Per-request wall clock. Vercel kills the function at 60s; stay well inside. */
-export const ANSWER_TIMEOUT_MS = 25_000;
+/**
+ * Two deadlines, because they guard different failures.
+ *
+ * FIRST_TOKEN is how long a model gets to say anything at all. Past that it is
+ * wedged or throttled and the next model in the chain should take over — and
+ * since nothing has been sent yet, the swap is invisible.
+ *
+ * ANSWER is the ceiling on the whole stream. A single deadline covering both
+ * cut long answers off mid-sentence: these models think for ten seconds and
+ * then emit the entire reply at once, so "slow to start" and "slow overall"
+ * look identical until the text arrives.
+ *
+ * Vercel kills the function at 60s; retrieval is bounded separately above.
+ */
+export const FIRST_TOKEN_TIMEOUT_MS = 20_000;
+export const ANSWER_TIMEOUT_MS = 45_000;
 export const UTILITY_TIMEOUT_MS = 8_000;
 export const RETRIEVAL_TIMEOUT_MS = 12_000;
 
